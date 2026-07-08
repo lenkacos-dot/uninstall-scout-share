@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-uninstall_scout.py — Cross-platform App Uninstall Remnants Scanner & Cleaner (v2.1)
+uninstall_scout.py — Cross-platform App Uninstall Remnants Scanner & Cleaner (v1.0.0)
 
 Inspired by Tencent Lemon Cleaner (macOS) concept: scan standard paths for
 orphaned files → match by bundle ID/app name → filter whitelist → report.
@@ -8,7 +8,7 @@ orphaned files → match by bundle ID/app name → filter whitelist → report.
 Cross-platform: macOS (primary) + Windows (secondary).
 Python 3.9+ stdlib only — no pip dependencies.
 
-Changes in v2.1:
+Changes in v1.0.0:
   - main() decomposed into _run_settings, _run_undo, _run_scan, _run_clean_force
   - _size_str / _dir_size memoized via functools.lru_cache
   - Case-insensitive plist bundle ID matching

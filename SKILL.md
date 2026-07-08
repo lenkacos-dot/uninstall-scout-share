@@ -108,7 +108,7 @@ python3 uninstall_scout.py --undo
 
 ## 与 Tencent Lemon 对比
 
-| 对比项 | Uninstall Scout v2.1 | Tencent Lemon |
+| 对比项 | Uninstall Scout v1.0.0 | Tencent Lemon |
 |--------|----------------------|---------------|
 | 平台 | macOS + Windows | macOS only |
 | 扫描 | 并行 8 线程 | 顺序 NSEnumerator |
