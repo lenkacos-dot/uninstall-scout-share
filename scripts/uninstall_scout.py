@@ -979,32 +979,33 @@ def interactive_clean(report: List[dict], config: dict) -> int:
         size_str = row["total_size_str"]
         files = row["file_count"]
         reason = row["reason"]
-        print(f"  [{idx:>2}] {app_display:<30} {size_str:>10} {files:>4} 件  {reason}")
+        print(f"  [{idx:>2}] 【{app_display}】  {size_str:>10}  {files:>4} 件  — {reason}")
 
     print()
-    print("  输入要清理的编号 (支持: 1,3-5,7 或 a=全部, ENTER=取消)")
+    print("  输入要清理的编号，支持:  1,3-5,7  或  a=全部,  空输入=取消")
     choice = input(f"  选择 [1-{len(cleanable)}, a, ENTER=取消]: ").strip()
 
     if not choice:
-        print("已取消，未执行任何删除。")
+        print("\n已取消，未执行任何删除。")
         return 0
 
     selected_indices = _parse_selection(choice, len(cleanable))
     if not selected_indices:
-        print("未选择任何项，已取消。")
+        print("\n未选择任何项，已取消。")
         return 0
 
     selected_items = []
     selected_size = 0
     print()
-    print(f"  选中的残留 ({len(selected_indices)} 组):")
+    print(f"  已选中 {len(selected_indices)} 个软件名下的文件:")
+    print()
     for idx in selected_indices:
         row = cleanable[idx - 1]
         app = row["app"]
         size_str = row["total_size_str"]
         files = row["file_count"]
         reason = row["reason"]
-        print(f"    [{idx:>2}] {app:<30} {size_str:>10} {files:>4} 件  {reason}")
+        print(f"  [{idx:>2}] 【{app:<30}】  {size_str:>10}  {files:>4} 件  — {reason}")
         for f in row["files"]:
             selected_items.append(f)
             selected_size += f["size"]
