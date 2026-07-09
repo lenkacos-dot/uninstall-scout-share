@@ -39,24 +39,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Tuple
 
 # ──────────────────────────────────────────────
 # 平台检测
 # ──────────────────────────────────────────────
 IS_MACOS = sys.platform == 'darwin'
 IS_WINDOWS = sys.platform == 'win32'
-IS_LINUX = sys.platform == 'linux'
 
 if not (IS_MACOS or IS_WINDOWS):
     print(f"⚠️  未完全测试的平台: {sys.platform} — 将尝试 macOS 兼容模式", file=sys.stderr)
 
 def _resolve(path: str) -> str:
     """解析 ~、%VAR% 和环境变量，返回绝对路径"""
-    p = path
-    if IS_WINDOWS:
-        # Windows: expand %APPDATA%, %LOCALAPPDATA%, etc.
-        p = os.path.expandvars(p)
+    p = os.path.expandvars(path)
     return str(Path(p).expanduser().resolve())
 
 
@@ -228,8 +224,8 @@ def get_active_scan_paths(config: dict) -> List[dict]:
     """返回生效的扫描路径（配置覆盖默认）"""
     cp = config.get("scan_paths")
     if cp:
-        return cp
-    return SCAN_PATHS
+        return list(cp)
+    return list(SCAN_PATHS)
 
 
 def get_active_whitelist_bundles(config: dict) -> List[str]:
@@ -272,6 +268,7 @@ WINDOWS_ALLOWED_ROOTS = [
 ]
 
 
+@functools.lru_cache(maxsize=1)
 def _get_allowed_roots() -> List[str]:
     """返回当前平台允许删除的沙箱根目录（已解析的绝对路径）"""
     raw_roots = MACOS_ALLOWED_ROOTS if IS_MACOS else WINDOWS_ALLOWED_ROOTS
@@ -356,10 +353,9 @@ def _read_plist(path: str) -> Optional[dict]:
     if not IS_MACOS:
         return None
     try:
-        import plistlib
         with open(path, "rb") as f:
             return plistlib.load(f)
-    except Exception:
+    except (OSError, ValueError, plistlib.InvalidFileException):
         return None
 
 
@@ -446,7 +442,7 @@ def _collect_installed_macos() -> Dict[str, dict]:
                 "built_in": built_in,
             }
 
-    def _scan_app_dir(base_dir: str, built_in: bool = False) -> List[dict]:
+    def _scan_app_dir(base_dir: str, built_in: bool = False) -> None:
         base = _resolve(base_dir)
         if not os.path.isdir(base):
             return
@@ -607,7 +603,7 @@ def scan_leftovers(
         scan_paths = get_active_scan_paths(config)
 
     known_keys = set(installed_bundles.keys())
-    known_keys_lower = {k.lower() for k in known_keys}
+    known_keys_lower = {k.lower(): k for k in known_keys}
 
     known_names: set = set()
     for info in installed_bundles.values():
@@ -629,7 +625,8 @@ def scan_leftovers(
         """检查 candidate 是否为已知 App 的 key（大小写不敏感）"""
         cl = candidate.lower()
         if cl in known_keys_lower:
-            return "built_in" if installed_bundles.get(candidate, {}).get("built_in") else "installed"
+            actual_key = known_keys_lower[cl]
+            return "built_in" if installed_bundles.get(actual_key, {}).get("built_in") else "installed"
         for prefix in wl_bundles:
             if cl.startswith(prefix.lower()):
                 return "built_in"
@@ -1157,8 +1154,8 @@ def interactive_clean(report: List[dict], config: dict) -> int:
 
 def _clean_windows_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]:
     """
-    Windows: 用 ctypes shell32.SHFileOperationW 移到回收站
-    回退: shutil.move 到临时回收目录
+    Windows: shutil.move 到 ~/.uninstall_scout_trash 回收目录（支持回滚）
+    注意：不是系统回收站，需手动清空该目录
     
     Returns: (success_count, undo_records, errors)
     """
@@ -1197,7 +1194,7 @@ def _clean_windows_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple
                 "method": "trash",
             })
             success += 1
-        except Exception as e:
+        except (OSError, shutil.Error) as e:
             errors.append((fp, str(e)))
 
     if success > 0:
@@ -1219,7 +1216,12 @@ def _clean_macos_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]
     errors = []
     
     def _escape_apple(s: str) -> str:
-        """转义 AppleScript 字符串：\\ → \\\\, \" → \\\", 换行→空格"""
+        """转义 AppleScript 字符串：\\ → \\\\, \" → \\\", 控制字符→空, 换行→空格"""
+        # 过滤控制字符 (0x00-0x08, 0x0B-0x1F, 0x7F)，保留 \n 单独处理
+        _ctrl_chars = dict.fromkeys(
+            [i for i in range(0x00, 0x09)] + [i for i in range(0x0B, 0x20)] + [0x7F]
+        )
+        s = s.translate(_ctrl_chars)
         return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
     for item in items:
@@ -1231,6 +1233,10 @@ def _clean_macos_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]
             continue  # 文件已不存在
         if stat.S_ISLNK(st.st_mode):
             errors.append((fp, "符号链接，已跳过"))
+            continue
+        # 删除前重新检查 in_use（扫描时的缓存值可能已过时）
+        if _is_in_use(fp):
+            errors.append((fp, "删除前检测到文件正在被占用，跳过"))
             continue
         is_dir = stat.S_ISDIR(st.st_mode)
         escaped = _escape_apple(fp)
@@ -1262,7 +1268,7 @@ def _clean_macos_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]
                 "method_detail": "osascript",
             })
             success += 1
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
             errors.append((fp, str(e)))
 
     return success, undo_records, errors
@@ -1333,6 +1339,10 @@ def clean_items(items: List[dict], force: bool = False,
             except OSError:
                 continue  # 文件已不存在
             is_dir = stat.S_ISDIR(st.st_mode)
+            # 删除前重新检查 in_use（扫描时的缓存值可能已过时）
+            if _is_in_use(fp):
+                errors.append((fp, "删除前检测到文件正在被占用，跳过"))
+                continue
             try:
                 if is_dir:
                     shutil.rmtree(fp, ignore_errors=True)
@@ -1346,7 +1356,7 @@ def clean_items(items: List[dict], force: bool = False,
                     "method": "rm",
                 })
                 success += 1
-            except Exception as e:
+            except (OSError, shutil.Error, PermissionError) as e:
                 errors.append((fp, str(e)))
         run_undo_records = undo_records
         if errors:
@@ -1374,6 +1384,10 @@ def clean_items(items: List[dict], force: bool = False,
                 errors.append((fp, "符号链接，已跳过"))
                 continue
             is_dir = stat.S_ISDIR(st.st_mode)
+            # 删除前重新检查 in_use（扫描时的缓存值可能已过时）
+            if _is_in_use(fp):
+                errors.append((fp, "删除前检测到文件正在被占用，跳过"))
+                continue
             try:
                 if is_dir:
                     shutil.rmtree(fp, ignore_errors=True)
@@ -1387,7 +1401,7 @@ def clean_items(items: List[dict], force: bool = False,
                     "method": "rm",
                 })
                 success += 1
-            except Exception as e:
+            except (OSError, shutil.Error, PermissionError) as e:
                 errors.append((fp, str(e)))
 
     # 打印错误
@@ -1553,7 +1567,6 @@ def main():
     parser.add_argument("--settings", action="store_true", help="查看/编辑持久化配置")
     parser.add_argument("--edit", action="store_true", help="交互式编辑配置")
     parser.add_argument("--undo", action="store_true", help="显示 undo log 记录")
-    parser.add_argument("--restore-undo", action="store_true", help="从 undo log 恢复 (复制回来)")
 
     args = parser.parse_args()
 
