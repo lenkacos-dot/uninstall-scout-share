@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-uninstall_scout.py — Cross-platform App Uninstall Remnants Scanner & Cleaner (v1.0.0)
+uninstall_scout.py — Cross-platform App Uninstall Remnants Scanner & Cleaner (v1.1.0)
 
 Inspired by Tencent Lemon Cleaner (macOS) concept: scan standard paths for
 orphaned files → match by bundle ID/app name → filter whitelist → report.
@@ -8,15 +8,13 @@ orphaned files → match by bundle ID/app name → filter whitelist → report.
 Cross-platform: macOS (primary) + Windows (secondary).
 Python 3.9+ stdlib only — no pip dependencies.
 
-Changes in v1.0.0:
-  - main() decomposed into _run_settings, _run_undo, _run_scan, _run_clean_force
-  - _size_str / _dir_size memoized via functools.lru_cache
-  - Case-insensitive plist bundle ID matching
-  - Thread-safe leftovers collection via threading.Lock
-  - Empty directories now reported instead of skipped
-  - macOS force-clean branch redundancy removed
-  - AppleScript path escaping for osascript
-  - POSIX folder/file type differentiation for AppleScript delete
+Security hardening in v1.1.0:
+  - _is_path_safe() path sandbox: only delete within ~/Library/ (macOS) or
+    %APPDATA%/%LOCALAPPDATA% (Windows); root dirs themselves blocked
+  - clean_items() internal pre-filter: in_use, path sandbox, symlink check
+    — enforced inside function, not relying on caller
+  - TOCTOU mitigation: os.lstat() snapshot before all delete operations
+  - No fallback to permanent deletion: osascript fails = skip, never remove
 
 Usage:
   python3 uninstall_scout.py                     # dry-run 扫描 + 表格
@@ -32,6 +30,7 @@ Usage:
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -244,6 +243,57 @@ def get_active_whitelist_apps(config: dict) -> List[str]:
     if IS_WINDOWS:
         wl.extend(WINDOWS_WHITELIST_DIRS)
     return wl + config.get("extra_whitelist_apps", [])
+
+
+# ──────────────────────────────────────────────
+# 路径沙箱 — 安全删除限制
+# ──────────────────────────────────────────────
+
+# macOS: 只允许删除 ~/Library/ 指定子目录下的文件/子目录
+MACOS_ALLOWED_ROOTS = [
+    "~/Library/Preferences",
+    "~/Library/Preferences/ByHost",
+    "~/Library/Caches",
+    "~/Library/Application Support",
+    "~/Library/Logs",
+    "~/Library/Saved Application State",
+    "~/Library/Containers",
+    "~/Library/Group Containers",
+    "~/Library/HTTPStorages",
+    "~/Library/WebKit/Domains",
+    "~/Library/LaunchAgents",
+]
+
+# Windows: 只允许删除 %APPDATA% / %LOCALAPPDATA% 下的子目录
+WINDOWS_ALLOWED_ROOTS = [
+    "%APPDATA%",
+    "%LOCALAPPDATA%",
+    "%USERPROFILE%\\.cache",
+]
+
+
+def _get_allowed_roots() -> List[str]:
+    """返回当前平台允许删除的沙箱根目录（已解析的绝对路径）"""
+    raw_roots = MACOS_ALLOWED_ROOTS if IS_MACOS else WINDOWS_ALLOWED_ROOTS
+    return [os.path.realpath(_resolve(p)) for p in raw_roots]
+
+
+def _is_path_safe(path: str) -> bool:
+    """
+    路径沙箱校验 — 只允许删除当前平台指定子目录下的子文件/子目录。
+    明确禁止删除沙箱根目录本身，防止误删整棵目录树。
+    """
+    try:
+        real_path = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    for root in _get_allowed_roots():
+        # 禁止删除沙箱根目录本身
+        if real_path == root:
+            return False
+        if real_path.startswith(root + os.sep):
+            return True
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -1125,9 +1175,15 @@ def _clean_windows_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple
 
     for item in items:
         fp = item["path"]
-        if not os.path.exists(fp):
+        # TOCTOU 缓解：用 lstat 快照文件状态
+        try:
+            st = os.lstat(fp)
+        except OSError:
+            continue  # 文件已不存在
+        if stat.S_ISLNK(st.st_mode):
+            errors.append((fp, "符号链接，已跳过"))
             continue
-        is_dir = os.path.isdir(fp)
+        is_dir = stat.S_ISDIR(st.st_mode)
         try:
             basename = os.path.basename(fp.rstrip("\\/"))
             dest = os.path.join(recycle_dir, f"{int(time.time())}_{basename}")
@@ -1152,7 +1208,9 @@ def _clean_windows_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple
 
 
 def _clean_macos_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]:
-    """macOS: 用 osascript 移废纸篓，回退 shutil.rmtree/os.remove
+    """
+    macOS: 用 osascript 移废纸篓。
+    失败时跳过文件，绝不回退到永久删除（shutil.rmtree / os.remove）。
     
     Returns: (success_count, undo_records, errors)
     """
@@ -1166,12 +1224,17 @@ def _clean_macos_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]
 
     for item in items:
         fp = item["path"]
-        if not os.path.exists(fp):
+        # TOCTOU 缓解：用 lstat 快照文件状态，检查符号链接
+        try:
+            st = os.lstat(fp)
+        except OSError:
+            continue  # 文件已不存在
+        if stat.S_ISLNK(st.st_mode):
+            errors.append((fp, "符号链接，已跳过"))
             continue
-        is_dir = os.path.isdir(fp)
+        is_dir = stat.S_ISDIR(st.st_mode)
         escaped = _escape_apple(fp)
         try:
-            # macOS has a 31-character posix_path limit in osascript sometimes
             if is_dir:
                 cmd = f'tell application "Finder" to delete POSIX folder "{escaped}"'
             else:
@@ -1185,25 +1248,20 @@ def _clean_macos_trash(items: List[dict]) -> Tuple[int, List[dict], List[tuple]]
             if deleted_by_osa:
                 deleted_by_osa = not os.path.exists(fp)
             if not deleted_by_osa:
-                # 回退
-                if is_dir:
-                    shutil.rmtree(fp, ignore_errors=True)
-                else:
-                    os.remove(fp)
-                deleted_by_fallback = not os.path.exists(fp)
-            else:
-                deleted_by_fallback = False
+                # 安全原则：废纸篓失败则跳过，绝不回退到永久删除
+                errors.append((fp, f"废纸篓删除失败 (osascript exit={result.returncode})"))
+                continue
 
-            if deleted_by_osa or deleted_by_fallback:
-                undo_records.append({
-                    "path": fp,
-                    "is_dir": is_dir,
-                    "deleted_at": time.time(),
-                    "timestamp": datetime.now().isoformat(),
-                    "method": "trash",
-                    "method_detail": "osascript" if deleted_by_osa else "fallback",
-                })
-                success += 1
+            # 成功删除（移入废纸篓）
+            undo_records.append({
+                "path": fp,
+                "is_dir": is_dir,
+                "deleted_at": time.time(),
+                "timestamp": datetime.now().isoformat(),
+                "method": "trash",
+                "method_detail": "osascript",
+            })
+            success += 1
         except Exception as e:
             errors.append((fp, str(e)))
 
@@ -1214,12 +1272,43 @@ def clean_items(items: List[dict], force: bool = False,
                 config: Optional[dict] = None) -> int:
     """
     删除指定残留文件/目录。
+    安全加固：强制检查 in_use、路径沙箱、符号链接（不可被调用方绕过）。
     写 undo log 到 ~/.uninstall_scout_undo.json
     返回成功删除的条数。
     """
     if config is None:
         config = {}
     clean_method = config.get("clean_method", "trash")
+
+    # ── 安全预过滤：强制检查 in_use、路径沙箱、符号链接 ──
+    filtered = []
+    skipped_reasons = []
+    for item in items:
+        fp = item["path"]
+        if item.get("in_use"):
+            skipped_reasons.append((fp, "文件正在被进程占用，已强制跳过"))
+            continue
+        if not _is_path_safe(fp):
+            skipped_reasons.append((fp, "路径不在允许的沙箱目录内，已拒绝删除"))
+            continue
+        # TOCTOU 缓解：用 lstat 快照检查符号链接
+        try:
+            st = os.lstat(fp)
+        except OSError:
+            continue  # 文件已不存在
+        if stat.S_ISLNK(st.st_mode):
+            skipped_reasons.append((fp, "符号链接，已跳过"))
+            continue
+        filtered.append(item)
+    items = filtered
+    if skipped_reasons:
+        print(f"\n⚠️  安全过滤：{len(skipped_reasons)} 个文件已跳过：")
+        for fp, reason in skipped_reasons:
+            print(f"  · {fp}: {reason}")
+
+    if not items:
+        print("没有可安全删除的文件。")
+        return 0
 
     if not force:
         print("\n即将删除以下文件/目录：")
@@ -1238,9 +1327,12 @@ def clean_items(items: List[dict], force: bool = False,
         errors = []
         for item in items:
             fp = item["path"]
-            if not os.path.exists(fp):
-                continue
-            is_dir = os.path.isdir(fp)
+            # TOCTOU 二次检查（即使过滤过也再检查一次，因为时间差可能变化）
+            try:
+                st = os.lstat(fp)
+            except OSError:
+                continue  # 文件已不存在
+            is_dir = stat.S_ISDIR(st.st_mode)
             try:
                 if is_dir:
                     shutil.rmtree(fp, ignore_errors=True)
@@ -1273,16 +1365,23 @@ def clean_items(items: List[dict], force: bool = False,
         errors = []
         for item in items:
             fp = item["path"]
-            if not os.path.exists(fp):
-                continue
+            # TOCTOU 二次检查
             try:
-                if os.path.isdir(fp):
+                st = os.lstat(fp)
+            except OSError:
+                continue  # 文件已不存在
+            if stat.S_ISLNK(st.st_mode):
+                errors.append((fp, "符号链接，已跳过"))
+                continue
+            is_dir = stat.S_ISDIR(st.st_mode)
+            try:
+                if is_dir:
                     shutil.rmtree(fp, ignore_errors=True)
                 else:
                     os.remove(fp)
                 run_undo_records.append({
                     "path": fp,
-                    "is_dir": os.path.isdir(fp),
+                    "is_dir": is_dir,
                     "deleted_at": time.time(),
                     "timestamp": datetime.now().isoformat(),
                     "method": "rm",
