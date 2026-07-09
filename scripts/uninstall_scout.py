@@ -140,6 +140,7 @@ WHITELIST_APP_NAMES = [
     "Stickies", "TextEdit", "Time Machine", "Voice Memos",
     "Siri", "Mission Control", "Launchpad",
     "Pages", "Numbers", "Keynote",
+    ".hermes",        # Hermes AI agent home directory — never delete
 ]
 
 # Windows 白名单 — 系统组件不清理
@@ -701,6 +702,80 @@ def scan_leftovers(
             for item in items:
                 gk = item["bundle_id"]
                 _add_leftover(gk, item)
+
+    # ── 额外步骤：扫描 /Applications/ 中的孤儿文件夹 ──
+    if IS_MACOS:
+        for apps_dir in ["/Applications", "~/Applications"]:
+            d = _resolve(apps_dir)
+            if not os.path.isdir(d):
+                continue
+            try:
+                for entry in sorted(os.listdir(d)):
+                    fp = os.path.join(d, entry)
+                    if not os.path.isdir(fp):
+                        continue
+                    if entry.endswith(".app"):
+                        continue  # .app bundle 本身在 installed 列表中
+                    # 这是一个非 .app 文件夹 → 可能是 SketchUp 2022 这种
+                    # 递归找里面的 .app 包
+                    inner_apps = []
+                    for root, dirs, files in os.walk(fp):
+                        for dn in dirs:
+                            if dn.endswith(".app"):
+                                inner_apps.append(os.path.join(root, dn))
+                        dirs[:] = [d for d in dirs if d != ".app"]
+                    if not inner_apps:
+                        continue  # 没有 .app 在里面，跳过
+                    # ── 判断：单 App 包 还是 孤儿文件夹 ──
+                    # 找顶级 .app（直接子级）
+                    top_apps = []
+                    try:
+                        for child in os.listdir(fp):
+                            child_path = os.path.join(fp, child)
+                            if os.path.isdir(child_path) and child.endswith(".app"):
+                                top_apps.append(child)
+                    except PermissionError:
+                        top_apps = []
+                    # 过滤掉 uninstaller 字样
+                    real_apps = [a for a in top_apps
+                                 if "uninstall" not in a.lower()]
+                    # 检查是否有顶级 .app 名称匹配文件夹名
+                    entry_lower = entry.lower()
+                    has_matching_app = any(
+                        os.path.splitext(a)[0].lower() == entry_lower
+                        for a in real_apps
+                    )
+                    if has_matching_app:
+                        # 例：FUJIFILM TETHER APP/FUJIFILM TETHER APP.app
+                        # 这是单 App 包，还在用，跳过
+                        continue
+                    # 跳过已知系统文件夹
+                    if entry in ("Utilities", ".localized"):
+                        continue
+                    # 跳过 whitelist 中的应用名
+                    base_lower = entry.lower()
+                    if any(base_lower == wl.lower() for wl in wl_apps):
+                        continue
+                    # 孤儿/套件残留 → 报告
+                    if real_apps:
+                        desc = f"已卸载的应用套件（内含 {', '.join(real_apps)}）"
+                    else:
+                        desc = "应用残留文件夹"
+                    sz = _dir_size(fp)
+                    mt = _get_mtime(fp)
+                    in_use = _is_in_use(fp)
+                    _add_leftover(entry, {
+                        "path": fp,
+                        "size": sz,
+                        "mtime": mt,
+                        "in_use": in_use,
+                        "type": "orphan_app_dir",
+                        "desc": desc,
+                        "bundle_id": entry,
+                        "empty_dir": sz == 0,
+                    })
+            except PermissionError:
+                pass
 
     return leftovers
 
